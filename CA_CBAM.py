@@ -106,7 +106,7 @@ class FaceRecognitionModel(nn.Module):
 # Load Model and Weights
 num_classes = 4  # Set the number of classes from your training dataset
 model = FaceRecognitionModel(num_classes)
-model.load_state_dict(torch.load(r"D:\Projects\Sentinel turret rover\model\CA_CBAM.pth", map_location=torch.device('cpu')))
+model.load_state_dict(torch.load(r"/home/raspberrypi/Intruder-Defense-System/CA_CBAM.pth", map_location=torch.device('cpu')))
 model.eval()
 
 # Define Transformations (Must match training)
@@ -122,7 +122,7 @@ detector = dlib.get_frontal_face_detector()
 # Open Webcam
 cap = cv2.VideoCapture(0)
 image_counter = 0
-save_dir = r'D:\Projects\Sentinel turret rover\cropped faces'
+save_dir = r'/home/raspberrypi/Intruder-Defense-System'
 os.makedirs(save_dir, exist_ok=True)
 
 while True:
@@ -136,14 +136,39 @@ while True:
     for face in faces:
         x, y, w, h = face.left(), face.top(), face.width(), face.height()
         face_img = frame[y:y+h, x:x+w]
+        if face_img.size==0:
+            continue
         face_pil = Image.fromarray(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB))
         face_tensor = transform(face_pil).unsqueeze(0)
 
         with torch.no_grad():
             output = model(face_tensor)
+            probabilities = torch.softmax(output , dim=1).squeeze().numpy()
             pred_class = torch.argmax(output, dim=1).item()
+        # Relative coordinates
+        face_cx = x + w // 2
+        face_cy = y + h // 2
+        frame_h, frame_w = frame.shape[:2]
+        frame_cx = frame_w // 2
+        frame_cy = frame_h // 2
+        dx = face_cx - frame_cx
+        dy = face_cy - frame_cy
+
+        # Distance estimation
+        K = 273.0  # <-- calibrated value
+        real_face_height = 22.0  # cm
+        distance = K * real_face_height / h
+
+        # Draw results
+        cv2.circle(frame, (face_cx, face_cy), 5, (0, 0, 255), -1)
+        cv2.putText(frame, f"Offset: ({dx}, {dy})", (x, y-30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+        cv2.putText(frame, f"Distance: {distance:.2f} cm", (x, y-50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+        cv2.line(frame, (frame_cx, frame_cy), (face_cx, face_cy), (255, 0, 0), 1)
 
         cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        for i,prob in enumerate(probabilities):
+                text=f"class {i}:{prob :.4f}"
+                cv2.putText(frame,text,(x,y+h+20+i*20),cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,0),1)
         cv2.putText(frame, f"Class: {pred_class}", (x, y-10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
