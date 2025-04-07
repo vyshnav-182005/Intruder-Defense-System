@@ -5,6 +5,8 @@ import torchvision.transforms as transforms
 from PIL import Image
 import os
 import torch.nn as nn
+import serial
+import time
 
 # Define the same model architecture as used during training
 class CrossAttention(nn.Module):
@@ -17,22 +19,21 @@ class CrossAttention(nn.Module):
 
     def forward(self, x1, x2):
         B, C, H, W = x1.shape
-        x1 = x1.flatten(2).permute(0, 2, 1)  
-        x2 = x2.flatten(2).permute(0, 2, 1)  
+        x1 = x1.flatten(2).permute(0, 2, 1)
+        x2 = x2.flatten(2).permute(0, 2, 1)
 
-        qkv1 = self.qkv(x1).chunk(3, dim=-1)  
-        qkv2 = self.qkv(x2).chunk(3, dim=-1)  
+        qkv1 = self.qkv(x1).chunk(3, dim=-1)
+        qkv2 = self.qkv(x2).chunk(3, dim=-1)
 
         q, k, v = qkv1[0], qkv2[1], qkv2[2]
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
-        out = attn @ v  
+        out = attn @ v
 
         out = self.proj(out)
         out = out.permute(0, 2, 1).reshape(B, C, H, W)
         return out
-
 
 class ChannelAttention(nn.Module):
     def __init__(self, in_channels):
@@ -104,27 +105,24 @@ class FaceRecognitionModel(nn.Module):
         return x
 
 # Load Model and Weights
-num_classes = 4  # Set the number of classes from your training dataset
+num_classes = 4
 model = FaceRecognitionModel(num_classes)
 model.load_state_dict(torch.load(r"/home/raspberrypi/Intruder-Defense-System/CA_CBAM.pth", map_location=torch.device('cpu')))
 model.eval()
 
-# Define Transformations (Must match training)
 transform = transforms.Compose([
     transforms.Resize((128, 128)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
 
-# Load dlib Face Detector
 detector = dlib.get_frontal_face_detector()
 
-# Open Webcam
-cap = cv2.VideoCapture(0)
-image_counter = 0
-save_dir = r'/home/raspberrypi/Intruder-Defense-System'
-os.makedirs(save_dir, exist_ok=True)
+# Initialize Serial
+ser = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
+time.sleep(2)
 
+cap = cv2.VideoCapture(0)
 while True:
     ret, frame = cap.read()
     if not ret:
@@ -136,45 +134,49 @@ while True:
     for face in faces:
         x, y, w, h = face.left(), face.top(), face.width(), face.height()
         face_img = frame[y:y+h, x:x+w]
-        if face_img.size==0:
+        if face_img.size == 0:
             continue
         face_pil = Image.fromarray(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB))
         face_tensor = transform(face_pil).unsqueeze(0)
 
         with torch.no_grad():
             output = model(face_tensor)
-            probabilities = torch.softmax(output , dim=1).squeeze().numpy()
+            probabilities = torch.softmax(output, dim=1).squeeze().numpy()
             pred_class = torch.argmax(output, dim=1).item()
-        # Relative coordinates
+
         face_cx = x + w // 2
         face_cy = y + h // 2
         frame_h, frame_w = frame.shape[:2]
-        frame_cx = frame_w // 2
-        frame_cy = frame_h // 2
-        dx = face_cx - frame_cx
-        dy = face_cy - frame_cy
+        dx = face_cx - frame_w // 2
+        dy = face_cy - frame_h // 2
 
-        # Distance estimation
-        K = 273.0  # <-- calibrated value
-        real_face_height = 22.0  # cm
+        K = 273.0
+        real_face_height = 22.0
         distance = K * real_face_height / h
 
-        # Draw results
-        cv2.circle(frame, (face_cx, face_cy), 5, (0, 0, 255), -1)
-        cv2.putText(frame, f"Offset: ({dx}, {dy})", (x, y-30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-        cv2.putText(frame, f"Distance: {distance:.2f} cm", (x, y-50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
-        cv2.line(frame, (frame_cx, frame_cy), (face_cx, face_cy), (255, 0, 0), 1)
+        fov_degrees = 60
+        fov_radians = fov_degrees * (3.14159265 / 180)
+        view_width_cm = 2 * distance * (torch.tan(torch.tensor(fov_radians / 2)))
 
-        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-        for i,prob in enumerate(probabilities):
-                text=f"class {i}:{prob :.4f}"
-                cv2.putText(frame,text,(x,y+h+20+i*20),cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,0),1)
-        cv2.putText(frame, f"Class: {pred_class}", (x, y-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        offset_x_cm = (dx / frame_w) * view_width_cm.item()
+        offset_y_cm = (dy / frame_w) * view_width_cm.item()
+
+        norm_x = max(min(offset_x_cm / 50, 1.0), -1.0)
+        norm_y = max(min(offset_y_cm / 50, 1.0), -1.0)
+        norm_z = max(min(distance / 100.0, 1.0), -1.0)
+
+        serial_msg = f"{norm_x:.2f} {norm_y:.2f} {norm_z:.2f}\n"
+        ser.write(serial_msg.encode())
+
+        cv2.putText(frame, f"Class: {pred_class}", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+        cv2.putText(frame, f"Offset: ({offset_x_cm:.2f}, {offset_y_cm:.2f}) cm", (x, y-30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+        cv2.putText(frame, f"Distance: {distance:.2f} cm", (x, y-50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,255), 1)
+        cv2.rectangle(frame, (x, y), (x+w, y+h), (0,255,0), 2)
 
     cv2.imshow("Face Classification", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
+ser.close()
 cap.release()
 cv2.destroyAllWindows()
